@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Schreibtisch Symbol-Manager
+Comment=Layouts der Symbole auf dem Schreibtisch sichern & laden
+# Pfade an die eigene Installation anpassen oder in der App
+# "Desktop-Starter erstellen" nutzen (erzeugt korrekte Pfade automatisch).
+Exec=python3 %h/.config/schreibtisch-symbol-manager/desktop_icon_manager.py
+Icon=%h/.config/schreibtisch-symbol-manager/app_icon.png
+Terminal=false
+Categories=Settings;Utility;

@@ -1,0 +1,18 @@
+# Persönliche Layout-Profile (werden von der App zur Laufzeit erzeugt)
+profiles/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Lokale Notiz
+readme
