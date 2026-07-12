@@ -36,10 +36,24 @@ class IconManager:
             if not os.path.exists(self.desktop_dir):
                 self.desktop_dir = os.path.expanduser("~/Desktop")
 
-        # GKeyFile für Nemo-Desktop-Metadaten (INIs-Datei, die Cinnamon NACH DEMNACH LIEST!)
+        # GKeyFile für Nemo-Desktop-Metadaten. Für Spezial-Objekte (Volumes,
+        # home, trash, network) ist DAS der maßgebliche Store, den Cinnamon liest.
         self.nemo_metadata_path = os.path.expanduser("~/.config/nemo/desktop-metadata")
-        self._keyfile = configparser.ConfigParser()
+        self._keyfile = self._new_keyfile_parser()
         self._load_keyfile()
+
+    @staticmethod
+    def _new_keyfile_parser():
+        """Erzeugt einen ConfigParser, der zum GKeyFile-Format von Nemo passt.
+
+        - interpolation=None: '%' in Werten wird nicht als Interpolation gedeutet.
+        - optionxform=str: Schlüssel-Groß/Kleinschreibung bleibt exakt erhalten.
+        Das ist wichtig, weil wir das Keyfile nicht nur lesen, sondern für
+        Spezial-Objekte auch WIEDER SCHREIBEN (format-erhaltend).
+        """
+        cp = configparser.ConfigParser(interpolation=None)
+        cp.optionxform = str
+        return cp
 
     # ---------- GKeyFile (nur Lese-Fallback) ----------
     #
@@ -51,14 +65,109 @@ class IconManager:
     # für Alt-Profile.
 
     def _load_keyfile(self):
-        """Lädt die Nemo-Desktop-Metadaten aus dem GKeyFile (nur zum Lesen)."""
+        """Lädt die Nemo-Desktop-Metadaten frisch aus dem GKeyFile neu ein."""
+        self._keyfile = self._new_keyfile_parser()
         if os.path.exists(self.nemo_metadata_path):
             try:
                 self._keyfile.read(self.nemo_metadata_path, encoding="utf-8")
             except Exception:
-                self._keyfile = configparser.ConfigParser()
-        else:
-            self._keyfile = configparser.ConfigParser()
+                self._keyfile = self._new_keyfile_parser()
+
+    # Sektionen im Keyfile, die KEINE Icons sind, sondern Layout-Konfiguration
+    _KEYFILE_LAYOUT_PREFIX = "desktop-monitor-"
+
+    def _get_special_items(self):
+        """Liest die Positionen aller Spezial-Objekte (Volumes, home, trash,
+        network) aus dem Keyfile. Diese Objekte sind KEINE Dateien auf dem
+        Desktop und werden von Nemo ausschließlich hier gespeichert — gio kennt
+        sie nicht.
+
+        Gibt ein dict {sektionsname: {position, timestamp, monitor, icon-scale}}
+        zurück.
+        """
+        self._load_keyfile()
+        items = {}
+        for section in self._keyfile.sections():
+            if section.startswith(self._KEYFILE_LAYOUT_PREFIX):
+                continue  # Layout-Konfig, kein Icon
+            sect = self._keyfile[section]
+            pos = sect.get("nemo-icon-position")
+            if not pos:
+                continue
+            entry = {"metadata::nemo-icon-position": pos}
+            ts = sect.get("nemo-icon-position-timestamp")
+            if ts:
+                entry["metadata::nemo-icon-position-timestamp"] = ts
+            mon = sect.get("monitor")
+            if mon is not None:
+                entry["monitor"] = mon
+            scale = sect.get("icon-scale")
+            if scale is not None:
+                entry["icon-scale"] = scale
+            items[section] = entry
+        return items
+
+    def _restore_special_items(self, special_items, timestamp, log_callback=None):
+        """Schreibt die Positionen der Spezial-Objekte (Volumes, home, trash,
+        network) format-erhaltend zurück ins Keyfile.
+
+        Nur bereits vorhandene Sektionen werden aktualisiert — ein Volume, das
+        aktuell nicht auf dem Desktop liegt (nicht eingehängt), wird übersprungen.
+
+        WICHTIG: Es wird pro Objekt ein frischer `nemo-icon-position-timestamp`
+        gesetzt, ABER der globale `nemo-icon-view-layout-timestamp` wird NICHT
+        angefasst. Ein frischer Item-Zeitstempel reicht, damit Nemo die Position
+        als "neuer als das letzte Layout" akzeptiert und exakt übernimmt. Bumpt
+        man dagegen den Layout-Zeitstempel selbst, erzwingt man bei
+        keep-aligned=true einen kompletten Raster-Neuaufbau, der eng stehende
+        Icons per Kollisionsauflösung wegschiebt — Icons landen "irgendwo".
+
+        Gibt die Anzahl tatsächlich geschriebener Objekte zurück.
+        """
+        if not special_items:
+            return 0
+        if not os.path.exists(self.nemo_metadata_path):
+            if log_callback:
+                log_callback("  [Warnung] Nemo-Keyfile nicht gefunden — Spezial-Objekte übersprungen.")
+            return 0
+
+        # Backup anlegen (einmal je Wiederherstellung), damit ein Fehler das
+        # Desktop-Layout nicht unwiederbringlich zerstört.
+        try:
+            shutil.copy2(self.nemo_metadata_path, self.nemo_metadata_path + ".bak")
+        except Exception:
+            pass
+
+        # Frisch neu einlesen, um parallele Nemo-Schreibvorgänge nicht zu überschreiben
+        self._load_keyfile()
+        ts = str(timestamp)
+        count = 0
+        for section, meta in special_items.items():
+            if section not in self._keyfile:
+                if log_callback:
+                    log_callback(f"  Überspringe Spezial-Objekt '{section}' (aktuell nicht auf dem Desktop)")
+                continue
+            pos = meta.get("metadata::nemo-icon-position")
+            if not pos:
+                continue
+            self._keyfile[section]["nemo-icon-position"] = pos
+            self._keyfile[section]["nemo-icon-position-timestamp"] = ts
+            if log_callback:
+                log_callback(f"Stelle Spezial-Objekt '{section}' auf {pos} wieder her...")
+            count += 1
+
+        # NICHT den Layout-Zeitstempel bumpen — siehe Docstring: das würde bei
+        # keep-aligned=true einen destruktiven Raster-Neuaufbau auslösen.
+
+        try:
+            with open(self.nemo_metadata_path, "w", encoding="utf-8") as f:
+                # space_around_delimiters=False -> GKeyFile-Format "key=value"
+                self._keyfile.write(f, space_around_delimiters=False)
+        except Exception as e:
+            if log_callback:
+                log_callback(f"  [Fehler] Keyfile-Schreiben fehlgeschlagen: {e}")
+            return 0
+        return count
 
     def _get_icon_position(self, filename):
         """Liest die aktuelle Icon-Position einer Datei.
@@ -151,10 +260,10 @@ class IconManager:
 
         files = []
         for name in os.listdir(self.desktop_dir):
-            # Schließe versteckte Dateien, temporäre Dateien und den Starter selbst aus
+            # Nur versteckte/temporäre Dateien ausschließen. Der eigene Starter
+            # (Schreibtisch-Symbol-Manager.desktop) wird bewusst MITverwaltet —
+            # sonst wird seine Position nie gespeichert/wiederhergestellt.
             if name.startswith("."):
-                continue
-            if name == "Schreibtisch-Symbol-Manager.desktop":
                 continue
             files.append(name)
         return files
@@ -171,6 +280,9 @@ class IconManager:
             "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "desktop_path": self.desktop_dir,
             "icons": {},
+            # Spezial-Objekte (Volumes, home, trash, network) — leben nur im
+            # Keyfile, nicht als Datei; gio kennt sie nicht.
+            "special_items": self._get_special_items(),
         }
 
         for filename in files:
@@ -193,7 +305,7 @@ class IconManager:
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(profile_data, f, indent=4, ensure_ascii=False)
 
-        return len(profile_data["icons"])
+        return len(profile_data["icons"]) + len(profile_data["special_items"])
 
     def align_icons_to_grid(self, grid_x, grid_y, custom_icons=None, log_callback=None):
         """Richtet Icons an einem Raster aus. Wenn custom_icons gegeben ist, wird dieses dict ausgerichtet."""
@@ -288,11 +400,18 @@ class IconManager:
             profile_data = json.load(f)
 
         icons = profile_data.get("icons", {})
+        special_items = profile_data.get("special_items", {})
 
         # Falls Rasterausrichtung beim Laden gewünscht ist
         if align_grid:
             gx, gy = align_grid
             icons = self.align_icons_to_grid(gx, gy, custom_icons=icons, log_callback=log_callback)
+
+        # EIN gemeinsamer Zeitstempel für die gesamte Wiederherstellung:
+        # gio-Dateien, Keyfile-Spezial-Objekte und der Layout-Zeitstempel
+        # bekommen denselben Wert, damit Nemo alles konsistent als "neueste"
+        # Anordnung akzeptiert.
+        ts = int(time.time())
 
         count = 0
         for filename, meta in icons.items():
@@ -309,9 +428,9 @@ class IconManager:
                 if pos_str:
                     try:
                         x, y = map(int, pos_str.split(","))
-                        # Frischer Zeitstempel (Default), damit Nemo die Position
+                        # Gemeinsamer frischer Zeitstempel, damit Nemo die Position
                         # als aktuell akzeptiert und nicht durch Auto-Layout verwirft
-                        self._set_icon_position(filename, x, y)
+                        self._set_icon_position(filename, x, y, timestamp=ts)
                         count += 1
                     except (ValueError, IndexError):
                         if log_callback:
@@ -322,6 +441,11 @@ class IconManager:
             else:
                 if log_callback:
                     log_callback(f"Überspringe '{filename}' (Datei existiert nicht mehr)")
+
+        # Spezial-Objekte (Volumes, home, trash, network) ins Keyfile schreiben.
+        # Das ist der eigentliche Store, den Nemo für diese Icons liest — ohne
+        # diesen Schritt bleiben Laufwerks-Icons auf ihrem Platz stehen.
+        count += self._restore_special_items(special_items, ts, log_callback=log_callback)
 
         # Nemo-Desktop neu starten, damit die Änderungen wirksam werden
         if log_callback:
@@ -345,7 +469,7 @@ class IconManager:
                         profiles.append({
                             "name": data.get("profile_name", name[:-5]),
                             "timestamp": data.get("timestamp", "0000-00-00 00:00:00"),
-                            "icon_count": len(data.get("icons", {})),
+                            "icon_count": len(data.get("icons", {})) + len(data.get("special_items", {})),
                             "filename": name
                         })
                 except Exception:

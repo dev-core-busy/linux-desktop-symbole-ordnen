@@ -62,10 +62,33 @@ This is the crux of the codebase, and getting it wrong silently breaks restore
    read here first. **Writes must use a current timestamp** so Nemo treats the
    position as newest and doesn't discard it during a relayout.
 2. **The Nemo GKeyFile** at `~/.config/nemo/desktop-metadata` (read via
-   `configparser` in `_load_keyfile`/`_get_icon_position`) natively holds only
-   *special* items (home, trash, volumes, network) — **not** regular files.
-   It's kept only as a read fallback for old profiles; the app no longer writes
-   it. (Writing regular-file positions here was the original restore bug.)
+   `configparser` in `_load_keyfile`) natively holds only *special* items
+   (home, trash, volumes, network) — **not** regular files. For those special
+   items the GKeyFile **is** the authoritative store; GIO does not know them
+   (they aren't files). So the app both reads them (`_get_special_items`, saved
+   into a profile's `special_items` dict) and writes them back on restore
+   (`_restore_special_items`). Regular-file positions must **never** be written
+   here (that was the original restore bug) — those go through GIO only.
+   - Keyfile **writes must preserve GKeyFile format**: use `_new_keyfile_parser`
+     (`configparser` with `interpolation=None` + `optionxform=str`) and
+     `write(f, space_around_delimiters=False)` so keys stay `key=value` (no
+     spaces) and section-name/key case is preserved. `configparser`'s defaults
+     (` = ` delimiter, lowercased keys) would corrupt the file.
+   - Only sections already present in the live keyfile are updated on restore;
+     an unmounted volume has no section and is skipped. A `.bak` copy is made
+     before writing. Each item gets a **fresh per-item
+     `nemo-icon-position-timestamp`**, but the global per-monitor
+     `nemo-icon-view-layout-timestamp` is **NEVER bumped by the app**. A fresh
+     item timestamp alone makes Nemo treat the position as "newer than the last
+     layout" and place it exactly. Bumping the layout timestamp yourself forces
+     a full grid re-snap under `keep-aligned=true`, which shoves closely-spaced
+     icons to new cells via collision resolution — icons land "somewhere". (This
+     also means grid snapping is NOT harmless as an earlier note claimed; the
+     only safe restore leaves the layout timestamp for Nemo to bump itself.)
+   - **Why this matters:** on a desktop dominated by mounted volumes/drives, the
+     old code (files only) restored ~nothing visible — every drive icon stayed
+     put. Volumes are captured only in *new* profiles; profiles saved before this
+     fix have an empty/absent `special_items` and cannot restore drive icons.
 
 **DANGER — do not touch `org.nemo.desktop desktop-layout`.** Its format is
 `bool:bool` = *"show desktop folder on primary monitor : show desktop on
@@ -74,8 +97,10 @@ remaining monitors"* — **not** keep-aligned/auto-layout. Setting it to
 (An earlier fix attempt misread this key and blanked the desktop.) Grid
 alignment lives elsewhere: `use-desktop-grid` (gsettings) and the per-monitor
 `nemo-icon-view-keep-aligned` key in the GKeyFile — the app does not modify
-these; profile coordinates are already grid-aligned so Nemo's grid snapping is
-harmless.
+these. With `keep-aligned=true`, Nemo re-snaps and de-collides the whole desktop
+whenever it does a full relayout, so restore must avoid triggering one (see the
+layout-timestamp rule above): write fresh per-item timestamps only and let Nemo
+bump the layout timestamp itself.
 
 **Applying changes requires restarting the desktop shell.** After writing
 positions, `_restart_nemo_desktop` runs `nemo-desktop -q` then relaunches it
