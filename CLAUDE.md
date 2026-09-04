@@ -13,15 +13,20 @@ them, optionally snapping icons to a grid. UI text and code comments are in
 ## Running
 
 ```bash
+pip install -r requirements.txt       # PyQt6 only
 python3 desktop_icon_manager.py       # launch the GUI
 ```
 
 Requires `PyQt6` (only dependency) plus the system tools `gio`, `xdg-user-dir`,
 `pgrep`, and `nemo-desktop` on PATH. Needs an active X11/Wayland session — the
-app detects a missing `DISPLAY`/`WAYLAND_DISPLAY` and disables position
-save/restore/align actions with a warning.
+`DISPLAY`/`WAYLAND_DISPLAY` check in `save_current_layout`,
+`restore_selected_layout` and `align_current_desktop_to_grid` aborts those
+actions with a German warning when neither is set.
 
-There is no build, test, or lint setup and no git repository.
+No build, test or lint setup — verification is manual (run the GUI on a real
+Cinnamon session). Git remote is
+`github.com/dev-core-busy/linux-desktop-symbole-ordnen`; commit messages are in
+German, matching the rest of the project.
 
 ## Deployment layout (important)
 
@@ -34,7 +39,8 @@ This project dir is the source; installation means copying
 
 Two distinct directories are easy to confuse:
 - **Profiles** are written to `~/.config/schreibtisch-symbol-manager/profiles/`
-  by `IconManager` at runtime. The `profiles/` folder in this repo is sample data.
+  by `IconManager` at runtime. The `profiles/` folder in this repo is untracked
+  local leftover data (gitignored) — the app never reads it.
 - **Nemo metadata** (the file Cinnamon actually reads) lives at
   `~/.config/nemo/desktop-metadata`.
 
@@ -102,29 +108,77 @@ whenever it does a full relayout, so restore must avoid triggering one (see the
 layout-timestamp rule above): write fresh per-item timestamps only and let Nemo
 bump the layout timestamp itself.
 
-**Applying changes requires restarting the desktop shell.** After writing
-positions, `_restart_nemo_desktop` runs `nemo-desktop -q` then relaunches it
-(GIO metadata is read at startup). It gracefully no-ops if `nemo-desktop` isn't
-running or installed.
+**Nemo has its own cell grid and re-snaps onto it.** With `keep-aligned=true`
+every position the app writes gets pulled to Nemo's nearest cell. That grid is
+not configurable and not exposed by gsettings, so `detect_nemo_grid()` derives
+it from the KeyFile: it takes the items carrying the **newest**
+`nemo-icon-position-timestamp` (those are the ones Nemo itself placed, hence
+exactly on-grid; older entries are leftovers sitting off-grid), then computes
+the GCD of the coordinate spacings per axis. On the dev machine that yields
+**85×66 starting at (49,16)**. Writing on any other grid (the old hardcoded
+100×100 at 50,50) makes evenly spaced icons land on unevenly spaced cells —
+that was the "grid alignment isn't symmetric" bug. The GUI seeds the spin boxes
+from the detection; `_warn_on_grid_mismatch` logs a warning when the chosen
+values aren't a multiple of Nemo's cell size.
+
+**Positions are written only while `nemo-desktop` is stopped.**
+`_write_positions` calls `_stop_nemo_desktop` (which polls `pgrep` until the
+process is really gone — `-q` returns early), writes GIO + KeyFile, then
+`_start_nemo_desktop` in a `finally` so the desktop never stays empty. Writing
+into a running nemo-desktop lets it re-snap the fresh values immediately. Both
+helpers no-op gracefully when `nemo-desktop` isn't running or installed.
 
 Symlinked launchers on the desktop (including broken ones) still show icons, so
 existence checks use `os.path.lexists`, not `os.path.exists`.
 
 ### Profiles
 
-JSON files (`<name>.json`) written by `save_profile`, one dict per icon under
-`icons`, keyed by filename, storing `metadata::nemo-icon-position` and its
-timestamp. `get_profiles` lists them sorted newest-first; `restore_profile`
-applies one (skipping icons whose files no longer exist).
+JSON files (`<name>.json`) written by `save_profile`, with two icon maps:
+- `icons` — regular desktop files keyed by filename, from GIO (KeyFile fallback
+  for legacy entries), storing `metadata::nemo-icon-position` and its timestamp.
+  Only files that actually have a position are saved.
+- `special_items` — keyed by KeyFile section name, plus the read-only `monitor`
+  and `icon-scale` values (captured for reference; restore writes back only
+  position + timestamp). Sections starting with `desktop-monitor-` are layout
+  config, not icons, and are skipped.
+
+`get_profiles` lists them sorted newest-first. `restore_profile` flattens both
+maps into one `[(kind, key, x, y)]` list (files and volumes share one surface,
+so they must be de-conflicted together), skips icons whose files no longer exist
+(`os.path.lexists`), then hands off to `_write_positions`, which computes **one
+shared timestamp** for the whole restore and applies it to both the GIO writes
+and the KeyFile special items. Volumes with no live KeyFile section are dropped
+by `_restore_special_items`.
+
+`_resolve_collisions` runs on every non-aligned restore: Nemo leaves **stale
+KeyFile entries**, so a profile can legitimately contain two volumes on the same
+position (measured: two such pairs on the dev desktop). Writing both back makes
+Nemo place one and shove the other somewhere — the "restore only moves some
+icons" bug. Duplicates now deterministically step down by one cell and say so in
+the log. Only writes that actually succeed are counted; `_set_icon_position`
+returning `False` is logged instead of silently inflating the total.
+
+`get_desktop_files` skips only dotfiles — the app's own
+`Schreibtisch-Symbol-Manager.desktop` launcher is deliberately managed like any
+other icon, so don't "fix" it by filtering it out.
 
 ### Grid alignment
 
-`align_icons_to_grid(grid_x, grid_y, custom_icons=None)` has two modes:
-- `custom_icons=None` → aligns the live desktop and writes back to the KeyFile.
-- `custom_icons=<dict>` → aligns a profile's icon dict in-memory and returns it
-  (used by `restore_profile` when "align on restore" is checked).
-It rounds each position to the nearest grid point with a fixed 50px offset and
-resolves collisions by pushing occupied cells down a row.
+`align_icons_to_grid(grid_x, grid_y, log_callback=None)` aligns the **whole live
+desktop**: files (read via `_get_icon_position`, written through GIO) *and*
+special items (read/written through the KeyFile). Leaving volumes out was the
+second half of the symmetry bug — on the dev desktop 13 of 22 icons are volumes,
+so a files-only pass could never look symmetric.
+
+The actual snapping lives in `_snap_layout(entries, grid_x, grid_y, grid)`,
+shared with `restore_profile`'s "align on restore" path. It takes a flat
+`[(kind, key, x, y)]` list so files and volumes occupy **one** collision map,
+rounds via `_snap` and pushes occupied cells down a row. Two details that matter:
+- The origin comes from `_grid_origin` — Nemo's detected origin (49,16 here),
+  falling back to 50,50. Snapping to a foreign origin guarantees Nemo re-snaps.
+- `_snap` uses `floor(x + 0.5)`, not `round()`. Python's `round()` is
+  round-half-to-even, so two icons equally far from a cell boundary would snap
+  in opposite directions.
 
 ## Gotchas
 
