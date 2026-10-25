@@ -121,7 +121,22 @@ is `min(coord) % cell` — the first cell, not the smallest observed item —
 because `_snap` clamps everything below the origin onto it (a single dragged
 icon at 899,412 used to become the origin and pull the whole desktop into one
 column). Per-axis unknown origins fall back to 50 in `_grid_origin`. On the dev
-machine that yields **85×66** (origin 49,16 or 58,10 depending on the session). Writing on any other grid (the old hardcoded
+machine that yields **85×66** (origin 49,16 or 58,10 depending on the session).
+Further rules in `detect_nemo_grid` / `_grid_from_groups`:
+- **The app's own timestamps don't count.** `_write_positions` records every
+  timestamp it writes in `~/.config/schreibtisch-symbol-manager/state.json`
+  (`app_timestamps`, last 50); a non-aligned restore stamps off-grid volume
+  positions with one fresh shared timestamp, which would otherwise look like a
+  Nemo layout. The last successful detection is cached there too
+  (`nemo_grid`) and returned with `cached: True` when no Nemo group is left.
+- **A single group's GCD can be a multiple of the real cell** (columns 49/219
+  only → 170). `_refine_cell` lowers it to the GCD with other Nemo groups (and
+  the cached grid) when their start points sit on the same lattice; it also
+  fills an axis that the best group couldn't determine.
+- **Each monitor is detected separately** (coordinates are monitor-relative).
+  The result is the monitor with the newest layout plus `origins`
+  (`{monitor: [x, y]}`); `_grid_origin(grid, monitor)` picks per monitor.
+Writing on any other grid (the old hardcoded
 100×100 at 50,50) makes evenly spaced icons land on unevenly spaced cells —
 that was the "grid alignment isn't symmetric" bug. The GUI seeds the spin boxes
 from the detection; `_warn_on_grid_mismatch` logs a warning when the chosen
@@ -153,12 +168,22 @@ JSON files (`<name>.json`) written by `save_profile`, with two icon maps:
   config, not icons, and are skipped.
 
 `get_profiles` lists them sorted newest-first. `restore_profile` flattens both
-maps into one `[(kind, key, x, y)]` list (files and volumes share one surface,
-so they must be de-conflicted together), skips icons whose files no longer exist
-(`os.path.lexists`), then hands off to `_write_positions`, which computes **one
-shared timestamp** for the whole restore and applies it to both the GIO writes
-and the KeyFile special items. Volumes with no live KeyFile section are dropped
-by `_restore_special_items`.
+maps into one `[(kind, key, x, y, monitor)]` list (files and volumes share one
+surface per monitor, so they must be de-conflicted together; old profiles
+without `metadata::monitor` default to `"0"`), skips icons whose files no longer
+exist (`os.path.lexists`), then hands off to `_write_positions`, which computes
+**one shared timestamp** for the whole restore and applies it to both the GIO
+writes and the KeyFile special items.
+
+**Ghost volumes are filtered before snapping/collision resolution**
+(`_special_entries`, used by restore and align): Nemo keeps a
+`<name>.volume` section for every drive it ever showed and never cleans up.
+Sections missing from the live keyfile, and `.volume` sections whose name isn't
+in `gio mount -l` (Volume/Mount lines), are skipped — otherwise they occupy
+cells and push real icons aside. If `gio mount -l` fails or lists nothing,
+`_mounted_volume_names` returns `None` and nothing is filtered (better one ghost
+too many than a real drive missing). On the dev desktop 6 of 10 volume sections
+are ghosts.
 
 `_resolve_collisions` runs on every non-aligned restore: Nemo leaves **stale
 KeyFile entries**, so a profile can legitimately contain two volumes on the same
@@ -176,16 +201,20 @@ other icon, so don't "fix" it by filtering it out.
 
 `align_icons_to_grid(grid_x, grid_y, log_callback=None)` aligns the **whole live
 desktop**: files (read via `_get_icon_position`, written through GIO) *and*
-special items (read/written through the KeyFile). Leaving volumes out was the
+special items (read/written through the KeyFile). The keyfile is read once per
+action and passed to `detect_nemo_grid(items)`; `get_gio_metadata` fetches all
+keys in **one** `gio info -a k1,k2,…` call per file (it used to spawn one
+process per key). Leaving volumes out was the
 second half of the symmetry bug — on the dev desktop 13 of 22 icons are volumes,
 so a files-only pass could never look symmetric.
 
 The actual snapping lives in `_snap_layout(entries, grid_x, grid_y, grid)`,
 shared with `restore_profile`'s "align on restore" path. It takes a flat
-`[(kind, key, x, y)]` list so files and volumes occupy **one** collision map,
-rounds via `_snap` and pushes occupied cells down a row. Two details that matter:
-- The origin comes from `_grid_origin` — Nemo's detected origin (49,16 here),
-  falling back to 50,50. Snapping to a foreign origin guarantees Nemo re-snaps.
+`[(kind, key, x, y, monitor)]` list so files and volumes occupy **one**
+collision map per monitor, rounds via `_snap` and pushes occupied cells down a
+row. Two details that matter:
+- The origin comes from `_grid_origin(grid, monitor)` — Nemo's detected origin
+  for that monitor (49,16 here), then the primary monitor's, then 50,50. Snapping to a foreign origin guarantees Nemo re-snaps.
 - `_snap` uses `floor(x + 0.5)`, not `round()`. Python's `round()` is
   round-half-to-even, so two icons equally far from a cell boundary would snap
   in opposite directions.

@@ -12,6 +12,7 @@ import time
 import configparser
 import shutil
 import math
+import re
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QListWidget, QPushButton, QLabel, QLineEdit, QMessageBox,
@@ -170,6 +171,67 @@ class IconManager:
             return 0
         return count
 
+    def _mounted_volume_names(self):
+        """Namen aller Volumes/Mounts laut 'gio mount -l' oder None.
+
+        Nemo legt im Keyfile für jedes jemals gezeigte Laufwerk eine Sektion
+        '<name>.volume' an und räumt sie nie auf. Angezeigt wird aber nur, was
+        gerade bekannt ist. None heißt "unbekannt" — dann wird nichts gefiltert,
+        lieber ein Geist zu viel als ein echtes Laufwerk zu wenig.
+        """
+        try:
+            out = subprocess.run(["gio", "mount", "-l"], capture_output=True,
+                                 text=True, timeout=5)
+        except Exception:
+            return None
+        if out.returncode != 0:
+            return None
+        names = set()
+        for line in out.stdout.splitlines():
+            m = re.match(r"\s*(?:Volume|Mount)\(\d+\):\s*(.*?)(?:\s+->\s+.*)?$", line)
+            if m:
+                names.add(m.group(1))
+        return names or None
+
+    def _is_ghost_volume(self, section, mounted):
+        """True für eine Volume-Sektion, deren Laufwerk gerade nicht da ist."""
+        return (mounted is not None and section.endswith(".volume")
+                and section[:-len(".volume")] not in mounted)
+
+    # ---------- Zustandsdatei ----------
+    #
+    # Merkt sich, welche Zeitstempel die App selbst geschrieben hat, und das
+    # zuletzt erkannte Nemo-Raster — beides braucht detect_nemo_grid, um
+    # eigene Schreibvorgänge nicht für Nemos Layout zu halten.
+
+    _MAX_OWN_TIMESTAMPS = 50
+
+    def _state_path(self):
+        return os.path.join(self.config_dir, "state.json")
+
+    def _load_state(self):
+        try:
+            with open(self._state_path(), "r", encoding="utf-8") as f:
+                state = json.load(f)
+            return state if isinstance(state, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_state(self, **changes):
+        state = self._load_state()
+        state.update(changes)
+        try:
+            with open(self._state_path(), "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=4, ensure_ascii=False)
+        except OSError:
+            pass
+
+    def _remember_own_timestamp(self, ts):
+        own = self._load_state().get("app_timestamps", [])
+        if ts not in own:
+            own.append(ts)
+        self._save_state(app_timestamps=own[-self._MAX_OWN_TIMESTAMPS:])
+
     # ---------- Nemos eigenes Zellraster ----------
     #
     # Nemo rastert bei keep-aligned=true JEDE geschriebene Position auf die
@@ -181,9 +243,14 @@ class IconManager:
     _GRID_MIN = 20    # entspricht dem Minimum der Spinboxen in der GUI
     _GRID_MAX = 300
 
-    def keep_aligned(self):
-        """True, wenn Nemo laut Keyfile selbst am Raster einrastet."""
-        self._load_keyfile()
+    def keep_aligned(self, reload=True):
+        """True, wenn Nemo laut Keyfile selbst am Raster einrastet.
+
+        reload=False nutzt das zuletzt geladene Keyfile — für Aufrufer, die es
+        gerade selbst frisch eingelesen haben.
+        """
+        if reload:
+            self._load_keyfile()
         for section in self._keyfile.sections():
             if not section.startswith(self._KEYFILE_LAYOUT_PREFIX):
                 continue
@@ -208,7 +275,77 @@ class IconManager:
             return step
         return None
 
-    def detect_nemo_grid(self):
+    @classmethod
+    def _refine_cell(cls, cell, start, others):
+        """Gleicht die Zellgröße einer Achse mit anderen Nemo-Layouts ab.
+
+        Der GCD einer einzelnen Gruppe kann ein Vielfaches der echten Zelle
+        sein: Liegen die Objekte nur in den Spalten 49 und 219, ergibt sich 170
+        statt 85. Zeigt ein anderes Layout auf DEMSELBEN Gitter (Startpunkte
+        passen zueinander) eine feinere Teilung, gilt die. Fehlt der Achse
+        die Zellgröße ganz, wird sie aus einer anderen Gruppe übernommen.
+
+        others = [(startwert, zellgröße)], gibt (zellgröße, startwert) zurück.
+        """
+        for o_start, o_cell in others:
+            if not o_cell:
+                continue
+            if not cell:
+                cell, start = o_cell, o_start
+                continue
+            g = math.gcd(cell, o_cell)
+            if cls._GRID_MIN <= g < cell and (start - o_start) % g == 0:
+                cell = g
+        return cell, start
+
+    def _grid_from_groups(self, entries, hint=None):
+        """Raster EINES Monitors aus [(ts, x, y)] oder None.
+
+        Zeitstempel-Gruppen vom jüngsten abwärts: Hat der Nutzer zuletzt nur
+        ein einziges Symbol verschoben, trägt allein dieses den jüngsten
+        Zeitstempel — daraus lässt sich nichts ablesen, also weiter zur
+        nächstälteren Gruppe (Nemos letztes komplettes Layout). Die übrigen
+        Gruppen und das zuletzt erkannte Raster (hint) dienen zum Abgleich.
+        """
+        groups = []
+        for stamp in sorted({ts for ts, _, _ in entries}, reverse=True):
+            xs = sorted({x for ts, x, _ in entries if ts == stamp})
+            ys = sorted({y for ts, _, y in entries if ts == stamp})
+            groups.append((stamp, xs, ys))
+
+        best = None
+        for group in groups:
+            cx, cy = self._spacing_gcd(group[1]), self._spacing_gcd(group[2])
+            if cx and cy:
+                best = group
+                break
+            if (cx or cy) and best is None:
+                best = group
+        if best is None:
+            return None
+
+        stamp, xs, ys = best
+        others_x = [(g[1][0], self._spacing_gcd(g[1])) for g in groups if g is not best]
+        others_y = [(g[2][0], self._spacing_gcd(g[2])) for g in groups if g is not best]
+        if hint:
+            others_x.append((hint.get("origin_x"), hint.get("cell_x")))
+            others_y.append((hint.get("origin_y"), hint.get("cell_y")))
+        cell_x, start_x = self._refine_cell(self._spacing_gcd(xs), xs[0], others_x)
+        cell_y, start_y = self._refine_cell(self._spacing_gcd(ys), ys[0], others_y)
+
+        # Ursprung = erste Zelle, nicht das kleinste beobachtete Objekt: liegt
+        # in Spalte 49 gerade nichts, wäre min(xs)=134 und alles links davon
+        # würde von _snap auf 134 geklemmt.
+        return {
+            "cell_x": cell_x,
+            "cell_y": cell_y,
+            "origin_x": start_x % cell_x if cell_x else None,
+            "origin_y": start_y % cell_y if cell_y else None,
+            "stamp": stamp,
+            "sample": sum(1 for ts, _, _ in entries if ts == stamp),
+        }
+
+    def detect_nemo_grid(self, items=None):
         """Leitet Nemos Zellraster aus dem Keyfile ab.
 
         Maßgeblich sind nur Objekte mit GLEICHEM Zeitstempel, bevorzugt dem
@@ -216,12 +353,25 @@ class IconManager:
         — sie liegen exakt auf seinem Raster. Ältere Einzeleinträge sind
         Altlasten und liegen daneben, sie würden die Erkennung verfälschen.
 
-        Gibt {cell_x, cell_y, origin_x, origin_y, monitor, sample} zurück
-        (cell_*/origin_* sind None, wenn eine Achse zu wenig Datenpunkte hat)
-        oder None, wenn sich auf keiner Achse ein Raster ableiten lässt.
+        Zeitstempel, die die App selbst geschrieben hat, zählen NICHT: Beim
+        Laden ohne Raster bekommen alle Objekte denselben frischen Zeitstempel,
+        auch auf Positionen neben Nemos Raster. Bleibt danach nichts übrig,
+        gilt das zuletzt erkannte Raster aus der Zustandsdatei ("cached").
+
+        Jeder Monitor wird getrennt ausgewertet (eigener Ursprung). Gibt das
+        Raster des Monitors mit dem jüngsten Nemo-Layout zurück —
+        {cell_x, cell_y, origin_x, origin_y, monitor, sample, origins} mit
+        origins = {monitor: [x, y]}; cell_*/origin_* sind None, wenn eine
+        Achse zu wenig Datenpunkte hat — oder None, wenn sich kein Raster
+        ableiten lässt.
         """
-        items = self._get_special_items()
-        entries = []
+        if items is None:
+            items = self._get_special_items()
+        state = self._load_state()
+        own = set(state.get("app_timestamps", []))
+        cached = state.get("nemo_grid")
+
+        by_monitor = {}
         for meta in items.values():
             pos = self._parse_pos(meta.get("metadata::nemo-icon-position"))
             if pos is None:
@@ -230,48 +380,38 @@ class IconManager:
                 ts = int(meta.get("metadata::nemo-icon-position-timestamp", 0))
             except (TypeError, ValueError):
                 ts = 0
-            entries.append((meta.get("monitor", "0"), ts, pos[0], pos[1]))
+            if ts in own:
+                continue  # von der App geschrieben, nicht von Nemo platziert
+            by_monitor.setdefault(str(meta.get("monitor", "0")), []).append((ts, pos[0], pos[1]))
 
-        if not entries:
-            return None
+        grids = {}
+        for mon, entries in by_monitor.items():
+            hint = cached if cached and cached.get("monitor") == mon else None
+            grid = self._grid_from_groups(entries, hint)
+            if grid:
+                grid["monitor"] = mon
+                grids[mon] = grid
 
-        # Zeitstempel-Gruppen vom jüngsten abwärts: Hat der Nutzer zuletzt nur
-        # ein einziges Symbol verschoben, trägt allein dieses den jüngsten
-        # Zeitstempel — daraus lässt sich nichts ablesen, also weiter zur
-        # nächstälteren Gruppe (Nemos letztes komplettes Layout).
-        partial = None
-        for stamp in sorted({ts for _, ts, _, _ in entries}, reverse=True):
-            # Nur einen Monitor betrachten — jeder Monitor hat seinen eigenen
-            # Ursprung, gemischt käme Unsinn heraus.
-            monitor = next(mon for mon, ts, _, _ in entries if ts == stamp)
-            on_grid = [(x, y) for mon, ts, x, y in entries
-                       if ts == stamp and mon == monitor]
-            xs = sorted({x for x, _ in on_grid})
-            ys = sorted({y for _, y in on_grid})
-            cell_x = self._spacing_gcd(xs)
-            cell_y = self._spacing_gcd(ys)
-            if not cell_x and not cell_y:
-                continue
-            # Ursprung = erste Zelle, nicht das kleinste beobachtete Objekt:
-            # liegt in Spalte 49 gerade nichts, wäre min(xs)=134 und alles
-            # links davon würde von _snap auf 134 geklemmt.
-            grid = {
-                "cell_x": cell_x,
-                "cell_y": cell_y,
-                "origin_x": xs[0] % cell_x if cell_x else None,
-                "origin_y": ys[0] % cell_y if cell_y else None,
-                "monitor": monitor,
-                "sample": len(on_grid),
-            }
-            if cell_x and cell_y:
-                return grid
-            partial = partial or grid
-        return partial
+        if not grids:
+            if cached:
+                cached["cached"] = True
+            return cached
 
-    def _grid_origin(self, grid):
-        """Ursprung fürs Rastern: Nemos erkannter Ursprung, sonst 50/50 (pro Achse)."""
+        grid = dict(max(grids.values(), key=lambda g: g["stamp"]))
+        grid["origins"] = {mon: [g["origin_x"], g["origin_y"]] for mon, g in grids.items()}
+        if grid != cached:
+            self._save_state(nemo_grid=grid)
+        return grid
+
+    def _grid_origin(self, grid, monitor=None):
+        """Ursprung fürs Rastern, pro Achse: der des Monitors, sonst Nemos
+        erkannter Ursprung, sonst 50/50."""
         grid = grid or {}
         ox, oy = grid.get("origin_x"), grid.get("origin_y")
+        if monitor is not None:
+            mx, my = (grid.get("origins") or {}).get(str(monitor), (None, None))
+            ox = ox if mx is None else mx
+            oy = oy if my is None else my
         return (50 if ox is None else ox), (50 if oy is None else oy)
 
     @staticmethod
@@ -288,20 +428,20 @@ class IconManager:
     def _get_icon_position(self, filename):
         """Liest die aktuelle Icon-Position einer Datei.
         Zuerst aus den GIO-Metadaten (das nutzt Nemo für Dateien),
-        dann als Fallback aus dem GKeyFile. Gibt (x, y) oder (None, None) zurück."""
-        # 1. GIO-Metadaten (maßgeblich für Dateien auf dem Desktop)
-        meta = self.get_gio_metadata(filename)
-        pos_str = meta.get("metadata::nemo-icon-position", "")
+        dann als Fallback aus dem GKeyFile. Gibt (x, y, monitor) oder None zurück."""
+        # 1. GIO-Metadaten (maßgeblich für Dateien auf dem Desktop) — nur die
+        # zwei Schlüssel, die hier gebraucht werden
+        meta = self.get_gio_metadata(
+            filename, keys=("metadata::nemo-icon-position", "metadata::monitor"))
+        pos = self._parse_pos(meta.get("metadata::nemo-icon-position"))
+        mon = meta.get("metadata::monitor", "0")
         # 2. Fallback: GKeyFile
-        if not pos_str and filename in self._keyfile:
-            pos_str = self._keyfile[filename].get("nemo-icon-position", "")
-        if pos_str:
-            try:
-                parts = pos_str.split(",")
-                return int(parts[0]), int(parts[1])
-            except (ValueError, IndexError):
-                pass
-        return None, None
+        if pos is None and filename in self._keyfile:
+            pos = self._parse_pos(self._keyfile[filename].get("nemo-icon-position"))
+            mon = self._keyfile[filename].get("monitor", mon)
+        if pos is None:
+            return None
+        return pos[0], pos[1], str(mon)
 
     def _set_icon_position(self, filename, x, y, timestamp=None):
         """Schreibt die Icon-Position via GIO-Metadaten — das ist der Store, den
@@ -333,40 +473,47 @@ class IconManager:
 
     # ---------- GIO (maßgeblicher Store für Datei-Positionen) ----------
 
-    def get_gio_metadata(self, filename):
+    # Nur die tatsächlich von Nemo/Cinnamon genutzten Keys lesen
+    _GIO_KEYS = (
+        "metadata::nemo-icon-position",
+        "metadata::nemo-icon-position-timestamp",
+        "metadata::monitor",
+        "metadata::icon-scale",
+        "metadata::nemo-icon-size",
+        "metadata::icon-text-clip",
+        "metadata::icon-alpha",
+    )
+
+    def get_gio_metadata(self, filename, keys=None):
         """Liest die GIO-Metadaten (inkl. Icon-Position) einer Desktop-Datei aus.
-        Das ist der maßgebliche Store, den Nemo/Cinnamon für Dateien nutzt."""
+        Das ist der maßgebliche Store, den Nemo/Cinnamon für Dateien nutzt.
+
+        Alle Schlüssel in EINEM 'gio info'-Aufruf — pro Schlüssel einen Prozess
+        zu starten, macht das Ausrichten bei vielen Dateien spürbar zäh.
+        """
         filepath = os.path.join(self.desktop_dir, filename)
         # lexists: auch (defekte) Symlinks berücksichtigen
         if not os.path.lexists(filepath):
             return {}
 
-        # Nur die tatsächlich von Nemo/Cinnamon genutzten Keys lesen
-        relevant_keys = [
-            "metadata::nemo-icon-position",
-            "metadata::nemo-icon-position-timestamp",
-            "metadata::nemo-icon-size",
-            "metadata::icon-text-clip",
-            "metadata::icon-alpha",
-        ]
+        keys = keys or self._GIO_KEYS
+        try:
+            output = subprocess.check_output(
+                ["gio", "info", "-a", ",".join(keys), filepath],
+                stderr=subprocess.DEVNULL, timeout=5,
+            ).decode("utf-8")
+        except Exception:
+            return {}  # gio fehlgeschlagen — wie "keine Metadaten"
 
         metadata = {}
-        for key in relevant_keys:
-            try:
-                output = subprocess.check_output(
-                    ["gio", "info", "-a", key, filepath],
-                    stderr=subprocess.DEVNULL,
-                ).decode("utf-8")
-
-                for line in output.splitlines():
-                    line = line.strip()
-                    if line.startswith(key + ":"):
-                        val = line[len(key) + 1 :].strip()
-                        if val:  # Nur nicht-leere Werte speichern
-                            metadata[key] = val
-            except Exception:
-                pass  # Key existiert nicht oder gio fehgeschlagen — einfach ignorieren
-
+        for line in output.splitlines():
+            line = line.strip()
+            for key in keys:
+                if line.startswith(key + ":"):
+                    val = line[len(key) + 1 :].strip()
+                    if val:  # Nur nicht-leere Werte speichern (fehlende lässt gio weg)
+                        metadata[key] = val
+                    break
         return metadata
 
     def get_desktop_files(self):
@@ -437,24 +584,26 @@ class IconManager:
         return offset + max(0, cells) * step
 
     def _snap_layout(self, entries, grid_x, grid_y, grid=None, log_callback=None):
-        """Rastert [(kind, key, x, y)] und löst Kollisionen auf.
+        """Rastert [(kind, key, x, y, monitor)] und löst Kollisionen auf.
 
         Dateien und Spezial-Objekte teilen sich EINE Fläche und deshalb auch
         EIN Belegungsraster — sonst würde ein Laufwerk auf derselben Zelle
         landen wie eine Datei. Belegte Zellen weichen eine Zeile nach unten aus.
+        Jeder Monitor ist eine eigene Fläche mit eigenem Ursprung: Koordinaten
+        sind monitor-relativ, gleiche Werte auf zwei Monitoren kollidieren nicht.
         """
-        offset_x, offset_y = self._grid_origin(grid)
         occupied = set()
         result = []
-        for kind, key, px, py in sorted(entries, key=lambda e: (e[2], e[3])):
+        for kind, key, px, py, mon in sorted(entries, key=lambda e: (e[4], e[2], e[3])):
+            offset_x, offset_y = self._grid_origin(grid, mon)
             rx = self._snap(px, grid_x, offset_x)
             ry = self._snap(py, grid_y, offset_y)
-            while (rx, ry) in occupied:
+            while (mon, rx, ry) in occupied:
                 ry += grid_y
-            occupied.add((rx, ry))
+            occupied.add((mon, rx, ry))
             if log_callback:
                 log_callback(f"Richte '{key}' aus auf Rasterpunkt ({rx}, {ry})")
-            result.append((kind, key, rx, ry))
+            result.append((kind, key, rx, ry, mon))
         return result
 
     def _resolve_collisions(self, entries, grid=None, log_callback=None):
@@ -464,17 +613,18 @@ class IconManager:
         auf derselben Position stehen (z.B. ein altes und ein aktuelles
         Laufwerk). Wird das so zurückgeschrieben, platziert Nemo nur eins davon
         und schiebt das andere selbst irgendwohin. Lieber deterministisch
-        ausweichen und es im Log sagen.
+        ausweichen und es im Log sagen. Kollisionen gibt es nur auf demselben
+        Monitor.
         """
         step_y = (grid or {}).get("cell_y")
         seen = {}
         result = []
-        for kind, key, x, y in sorted(entries, key=lambda e: (e[2], e[3])):
-            if (x, y) in seen:
-                other = seen[(x, y)]
+        for kind, key, x, y, mon in sorted(entries, key=lambda e: (e[4], e[2], e[3])):
+            if (mon, x, y) in seen:
+                other = seen[(mon, x, y)]
                 if step_y:
                     ny = y
-                    while (x, ny) in seen:
+                    while (mon, x, ny) in seen:
                         ny += step_y
                     if log_callback:
                         log_callback(f"  [Kollision] '{key}' und '{other}' liegen im Profil "
@@ -483,13 +633,17 @@ class IconManager:
                 elif log_callback:
                     log_callback(f"  [Warnung] '{key}' und '{other}' liegen im Profil beide "
                                  f"auf {x},{y} — Nemo wird eines davon selbst verschieben")
-            seen[(x, y)] = key
-            result.append((kind, key, x, y))
+            seen[(mon, x, y)] = key
+            result.append((kind, key, x, y, mon))
         return result
 
     def _warn_on_grid_mismatch(self, grid_x, grid_y, grid, log_callback):
-        """Warnt, wenn das gewählte Raster nicht zu Nemos Zellraster passt."""
-        if not log_callback or not grid or not self.keep_aligned():
+        """Warnt, wenn das gewählte Raster nicht zu Nemos Zellraster passt.
+
+        Erwartet ein frisch geladenes Keyfile (Aufrufer haben gerade
+        _get_special_items gelesen).
+        """
+        if not log_callback or not grid or not self.keep_aligned(reload=False):
             return
         cx, cy = grid.get("cell_x"), grid.get("cell_y")
         if (cx and grid_x % cx) or (cy and grid_y % cy):
@@ -501,6 +655,29 @@ class IconManager:
                 f"Nemo wird die Symbole nachziehen und die Abstände werden ungleich."
             )
 
+    def _special_entries(self, special_items, log_callback=None):
+        """[(kind, key, x, y, monitor)] der Spezial-Objekte, die Nemo gerade zeigt.
+
+        Ausgefiltert werden Sektionen, die im Live-Keyfile fehlen, und
+        Volume-Altlasten, deren Laufwerk nicht eingehängt ist. Beide würden
+        sonst beim Rastern bzw. in der Kollisionsauflösung Zellen belegen und
+        echte Symbole verdrängen, obwohl sie nie sichtbar werden.
+        Erwartet ein frisch geladenes Keyfile.
+        """
+        mounted = self._mounted_volume_names()
+        entries = []
+        for section, meta in special_items.items():
+            if section not in self._keyfile or self._is_ghost_volume(section, mounted):
+                if log_callback:
+                    log_callback(f"  Überspringe Spezial-Objekt '{section}' "
+                                 f"(aktuell nicht auf dem Desktop)")
+                continue
+            pos = self._parse_pos(meta.get("metadata::nemo-icon-position"))
+            if pos:
+                entries.append(("special", section, pos[0], pos[1],
+                                str(meta.get("monitor", "0"))))
+        return entries
+
     def align_icons_to_grid(self, grid_x, grid_y, log_callback=None):
         """Richtet den kompletten Schreibtisch am Raster aus.
 
@@ -510,7 +687,9 @@ class IconManager:
 
         Gibt die Anzahl tatsächlich geschriebener Symbole zurück.
         """
-        grid = self.detect_nemo_grid()
+        # Keyfile EINMAL lesen und für Erkennung, Warnung und Positionen nutzen
+        items = self._get_special_items()
+        grid = self.detect_nemo_grid(items)
         offset_x, offset_y = self._grid_origin(grid)
         if log_callback:
             log_callback(f"Berechne Raster-Ausrichtung ({grid_x}x{grid_y} Pixel) "
@@ -520,13 +699,10 @@ class IconManager:
         entries = []
         for filename in self.get_desktop_files():
             # Aktuelle Position lesen (GIO zuerst, KeyFile als Fallback)
-            x, y = self._get_icon_position(filename)
-            if x is not None:
-                entries.append(("file", filename, x, y))
-        for section, meta in self._get_special_items().items():
-            pos = self._parse_pos(meta.get("metadata::nemo-icon-position"))
-            if pos:
-                entries.append(("special", section, pos[0], pos[1]))
+            pos = self._get_icon_position(filename)
+            if pos is not None:
+                entries.append(("file", filename) + pos)
+        entries += self._special_entries(items, log_callback)
 
         if not entries:
             if log_callback:
@@ -539,7 +715,7 @@ class IconManager:
         )
 
     def _write_positions(self, entries, log_callback=None):
-        """Schreibt [(kind, key, x, y)] und startet den Nemo-Schreibtisch neu.
+        """Schreibt [(kind, key, x, y, monitor)] und startet den Nemo-Schreibtisch neu.
 
         Geschrieben wird erst, wenn nemo-desktop steht: solange es läuft,
         rastert es frisch geschriebene Positionen sofort nach und kann eigene
@@ -547,6 +723,9 @@ class IconManager:
         Schreiben etwas schiefgeht — sonst bliebe der Schreibtisch leer.
         """
         ts = int(time.time())
+        # Vor dem Schreiben merken: detect_nemo_grid darf diesen Zeitstempel
+        # später nicht für ein Nemo-Layout halten.
+        self._remember_own_timestamp(ts)
         specials = {}
         count = 0
         failed = 0
@@ -555,7 +734,7 @@ class IconManager:
         # vorher nicht, legt ein Start einen fremden Schreibtisch über die Session.
         stopped = self._stop_nemo_desktop(log_callback)
         try:
-            for kind, key, x, y in entries:
+            for kind, key, x, y, _mon in entries:
                 if kind == "special":
                     specials[key] = {"metadata::nemo-icon-position": f"{x},{y}"}
                     continue
@@ -602,22 +781,22 @@ class IconManager:
                 if log_callback:
                     log_callback(f"  [Warnung] Keine gültige Position für '{filename}' im Profil")
                 continue
-            entries.append(("file", filename, pos[0], pos[1]))
+            # Ältere Profile kennen den Monitor nicht — dann Monitor 0
+            entries.append(("file", filename, pos[0], pos[1],
+                            str(meta.get("metadata::monitor", "0"))))
 
-        # Spezial-Objekte (Volumes, home, trash, network): Sektionen, die es im
-        # Keyfile nicht mehr gibt (nicht eingehängtes Laufwerk), filtert
-        # _restore_special_items beim Schreiben heraus.
-        for section, meta in special_items.items():
-            pos = self._parse_pos(meta.get("metadata::nemo-icon-position"))
-            if pos:
-                entries.append(("special", section, pos[0], pos[1]))
+        # Live-Keyfile EINMAL lesen: für die Raster-Erkennung und um
+        # Spezial-Objekte zu verwerfen, die Nemo gerade nicht zeigt — BEVOR sie
+        # in Rasterung oder Kollisionsauflösung Zellen belegen.
+        live_items = self._get_special_items()
+        entries += self._special_entries(special_items, log_callback)
 
         if not entries:
             if log_callback:
                 log_callback("Profil enthält keine anwendbaren Positionen.")
             return 0
 
-        grid = self.detect_nemo_grid()
+        grid = self.detect_nemo_grid(live_items)
         if align_grid:
             gx, gy = align_grid
             self._warn_on_grid_mismatch(gx, gy, grid, log_callback)
@@ -625,7 +804,7 @@ class IconManager:
         else:
             entries = self._resolve_collisions(entries, grid, log_callback)
             if log_callback:
-                for kind, key, x, y in entries:
+                for kind, key, x, y, _mon in entries:
                     log_callback(f"Stelle Position für '{key}' auf {x},{y} wieder her...")
 
         return self._write_positions(entries, log_callback=log_callback)
@@ -1035,7 +1214,9 @@ class DesktopIconManagerApp(QMainWindow):
 
         if self.nemo_grid:
             ox, oy = self.manager._grid_origin(self.nemo_grid)
-            hint = (f"Nemos eigenes Zellraster: {default_x}x{default_y} px ab "
+            # Nicht erkannte Achsen als '?' zeigen, nicht als Vorgabe 100
+            hint = (f"Nemos eigenes Zellraster: {self.nemo_grid.get('cell_x') or '?'}x"
+                    f"{self.nemo_grid.get('cell_y') or '?'} px ab "
                     f"({ox},{oy}).\n"
                     "Andere Werte zieht Nemo nach — die Abstände werden dann\n"
                     "ungleichmäßig.")
@@ -1108,7 +1289,9 @@ class DesktopIconManagerApp(QMainWindow):
             self.log(f"System initialisiert. Desktop-Pfad: {self.manager.desktop_dir}")
             if self.nemo_grid:
                 ox, oy = self.manager._grid_origin(self.nemo_grid)
-                self.log(f"Nemo-Zellraster erkannt: "
+                source = ("zuletzt erkannt" if self.nemo_grid.get("cached")
+                          else "erkannt")
+                self.log(f"Nemo-Zellraster {source}: "
                          f"{self.nemo_grid.get('cell_x') or '?'}x{self.nemo_grid.get('cell_y') or '?'} px "
                          f"ab ({ox},{oy}) "
                          f"– als Raster-Vorgabe übernommen.")
