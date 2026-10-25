@@ -26,7 +26,9 @@ actions with a German warning when neither is set.
 No build, test or lint setup — verification is manual (run the GUI on a real
 Cinnamon session). Git remote is
 `github.com/dev-core-busy/linux-desktop-symbole-ordnen`; commit messages are in
-German, matching the rest of the project.
+German, matching the rest of the project. **Work directly on `main`** — the
+owner wants a single branch: no feature branches, no PRs; commit and push to
+`main`.
 
 ## Deployment layout (important)
 
