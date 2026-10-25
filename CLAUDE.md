@@ -114,8 +114,14 @@ not configurable and not exposed by gsettings, so `detect_nemo_grid()` derives
 it from the KeyFile: it takes the items carrying the **newest**
 `nemo-icon-position-timestamp` (those are the ones Nemo itself placed, hence
 exactly on-grid; older entries are leftovers sitting off-grid), then computes
-the GCD of the coordinate spacings per axis. On the dev machine that yields
-**85×66 starting at (49,16)**. Writing on any other grid (the old hardcoded
+the GCD of the coordinate spacings per axis. If the newest group yields no
+cell size (typically a single icon the user just dragged), it falls back to the
+next-older timestamp group; with no usable group it returns `None`. The origin
+is `min(coord) % cell` — the first cell, not the smallest observed item —
+because `_snap` clamps everything below the origin onto it (a single dragged
+icon at 899,412 used to become the origin and pull the whole desktop into one
+column). Per-axis unknown origins fall back to 50 in `_grid_origin`. On the dev
+machine that yields **85×66** (origin 49,16 or 58,10 depending on the session). Writing on any other grid (the old hardcoded
 100×100 at 50,50) makes evenly spaced icons land on unevenly spaced cells —
 that was the "grid alignment isn't symmetric" bug. The GUI seeds the spin boxes
 from the detection; `_warn_on_grid_mismatch` logs a warning when the chosen
@@ -123,10 +129,14 @@ values aren't a multiple of Nemo's cell size.
 
 **Positions are written only while `nemo-desktop` is stopped.**
 `_write_positions` calls `_stop_nemo_desktop` (which polls `pgrep` until the
-process is really gone — `-q` returns early), writes GIO + KeyFile, then
-`_start_nemo_desktop` in a `finally` so the desktop never stays empty. Writing
-into a running nemo-desktop lets it re-snap the fresh values immediately. Both
-helpers no-op gracefully when `nemo-desktop` isn't running or installed.
+process is really gone — `-q` returns early — and escalates to `pkill -TERM`
+after 3 s), writes GIO + KeyFile, then `_start_nemo_desktop` in a `finally` so
+the desktop never stays empty. Writing into a running nemo-desktop lets it
+re-snap the fresh values immediately. The restart happens **only if
+`_stop_nemo_desktop` returned True** (i.e. the app stopped it) — starting
+nemo-desktop when it wasn't running would overlay a foreign desktop on the
+session. `_start_nemo_desktop` first waits for a still-dying process to vanish;
+otherwise `pgrep` would see it, skip the restart, and leave the desktop empty.
 
 Symlinked launchers on the desktop (including broken ones) still show icons, so
 existence checks use `os.path.lexists`, not `os.path.exists`.

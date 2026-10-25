@@ -211,14 +211,14 @@ class IconManager:
     def detect_nemo_grid(self):
         """Leitet Nemos Zellraster aus dem Keyfile ab.
 
-        Maßgeblich sind nur die Objekte mit dem JÜNGSTEN Zeitstempel: Das sind
-        die, die Nemo bei seinem letzten Layout selbst gesetzt hat — sie liegen
-        exakt auf seinem Raster. Ältere Einträge sind Altlasten und liegen
-        daneben, sie würden die Erkennung verfälschen.
+        Maßgeblich sind nur Objekte mit GLEICHEM Zeitstempel, bevorzugt dem
+        jüngsten: Das sind die, die Nemo bei einem Layout gemeinsam gesetzt hat
+        — sie liegen exakt auf seinem Raster. Ältere Einzeleinträge sind
+        Altlasten und liegen daneben, sie würden die Erkennung verfälschen.
 
         Gibt {cell_x, cell_y, origin_x, origin_y, monitor, sample} zurück
-        (cell_* kann None sein, wenn eine Achse zu wenig Datenpunkte hat) oder
-        None, wenn das Keyfile keine brauchbaren Positionen enthält.
+        (cell_*/origin_* sind None, wenn eine Achse zu wenig Datenpunkte hat)
+        oder None, wenn sich auf keiner Achse ein Raster ableiten lässt.
         """
         items = self._get_special_items()
         entries = []
@@ -235,31 +235,44 @@ class IconManager:
         if not entries:
             return None
 
-        newest = max(ts for _, ts, _, _ in entries)
-        # Nur einen Monitor betrachten — jeder Monitor hat seinen eigenen
-        # Ursprung, gemischt käme Unsinn heraus.
-        monitor = next(mon for mon, ts, _, _ in entries if ts == newest)
-        on_grid = [(x, y) for mon, ts, x, y in entries
-                   if ts == newest and mon == monitor]
-        if not on_grid:
-            return None
-
-        xs = sorted({x for x, _ in on_grid})
-        ys = sorted({y for _, y in on_grid})
-        return {
-            "cell_x": self._spacing_gcd(xs),
-            "cell_y": self._spacing_gcd(ys),
-            "origin_x": xs[0],
-            "origin_y": ys[0],
-            "monitor": monitor,
-            "sample": len(on_grid),
-        }
+        # Zeitstempel-Gruppen vom jüngsten abwärts: Hat der Nutzer zuletzt nur
+        # ein einziges Symbol verschoben, trägt allein dieses den jüngsten
+        # Zeitstempel — daraus lässt sich nichts ablesen, also weiter zur
+        # nächstälteren Gruppe (Nemos letztes komplettes Layout).
+        partial = None
+        for stamp in sorted({ts for _, ts, _, _ in entries}, reverse=True):
+            # Nur einen Monitor betrachten — jeder Monitor hat seinen eigenen
+            # Ursprung, gemischt käme Unsinn heraus.
+            monitor = next(mon for mon, ts, _, _ in entries if ts == stamp)
+            on_grid = [(x, y) for mon, ts, x, y in entries
+                       if ts == stamp and mon == monitor]
+            xs = sorted({x for x, _ in on_grid})
+            ys = sorted({y for _, y in on_grid})
+            cell_x = self._spacing_gcd(xs)
+            cell_y = self._spacing_gcd(ys)
+            if not cell_x and not cell_y:
+                continue
+            # Ursprung = erste Zelle, nicht das kleinste beobachtete Objekt:
+            # liegt in Spalte 49 gerade nichts, wäre min(xs)=134 und alles
+            # links davon würde von _snap auf 134 geklemmt.
+            grid = {
+                "cell_x": cell_x,
+                "cell_y": cell_y,
+                "origin_x": xs[0] % cell_x if cell_x else None,
+                "origin_y": ys[0] % cell_y if cell_y else None,
+                "monitor": monitor,
+                "sample": len(on_grid),
+            }
+            if cell_x and cell_y:
+                return grid
+            partial = partial or grid
+        return partial
 
     def _grid_origin(self, grid):
-        """Ursprung fürs Rastern: Nemos erkannter Ursprung, sonst 50/50."""
-        if grid:
-            return grid["origin_x"], grid["origin_y"]
-        return 50, 50
+        """Ursprung fürs Rastern: Nemos erkannter Ursprung, sonst 50/50 (pro Achse)."""
+        grid = grid or {}
+        ox, oy = grid.get("origin_x"), grid.get("origin_y")
+        return (50 if ox is None else ox), (50 if oy is None else oy)
 
     @staticmethod
     def _parse_pos(pos_str):
@@ -480,9 +493,10 @@ class IconManager:
             return
         cx, cy = grid.get("cell_x"), grid.get("cell_y")
         if (cx and grid_x % cx) or (cy and grid_y % cy):
+            ox, oy = self._grid_origin(grid)
             log_callback(
                 f"  [Warnung] Nemo rastert selbst nach (keep-aligned=true) auf "
-                f"{cx or '?'}x{cy or '?'} px ab ({grid['origin_x']},{grid['origin_y']}). "
+                f"{cx or '?'}x{cy or '?'} px ab ({ox},{oy}). "
                 f"Das gewählte Raster {grid_x}x{grid_y} ist kein Vielfaches davon — "
                 f"Nemo wird die Symbole nachziehen und die Abstände werden ungleich."
             )
@@ -537,7 +551,9 @@ class IconManager:
         count = 0
         failed = 0
 
-        self._stop_nemo_desktop(log_callback)
+        # Nur neu starten, was wir selbst angehalten haben — lief nemo-desktop
+        # vorher nicht, legt ein Start einen fremden Schreibtisch über die Session.
+        stopped = self._stop_nemo_desktop(log_callback)
         try:
             for kind, key, x, y in entries:
                 if kind == "special":
@@ -552,7 +568,8 @@ class IconManager:
                                      f"geschrieben werden (gio set fehlgeschlagen)")
             count += self._restore_special_items(specials, ts, log_callback=log_callback)
         finally:
-            self._start_nemo_desktop(log_callback)
+            if stopped:
+                self._start_nemo_desktop(log_callback)
 
         if failed and log_callback:
             log_callback(f"  {failed} Symbol(e) konnten nicht geschrieben werden.")
@@ -645,13 +662,22 @@ class IconManager:
         except Exception:
             return False
 
+    def _wait_nemo_desktop_gone(self, seconds):
+        """Wartet bis nemo-desktop weg ist; True, wenn es innerhalb der Zeit endete."""
+        for _ in range(int(seconds * 10)):
+            if not self._nemo_desktop_running():
+                return True
+            time.sleep(0.1)
+        return not self._nemo_desktop_running()
+
     def _stop_nemo_desktop(self, log_callback=None):
         """Beendet den Nemo-Schreibtisch, BEVOR Positionen geschrieben werden.
 
         Solange nemo-desktop läuft, rastert es frisch geschriebene Positionen
         sofort nach und kann eigene Werte zurückschreiben — geschrieben wird
         deshalb erst, wenn es wirklich steht. Gibt True zurück, wenn es lief
-        und beendet wurde.
+        und ein Beenden angestoßen wurde — dann ist der Aufrufer für den
+        Neustart zuständig.
         """
         if not self._nemo_desktop_running():
             if log_callback:
@@ -672,11 +698,17 @@ class IconManager:
             return False
 
         # Warten bis der Prozess wirklich weg ist (max. 3 s) statt blind zu
-        # schlafen — '-q' kehrt zurück, bevor der Prozess beendet ist.
-        for _ in range(30):
-            if not self._nemo_desktop_running():
-                break
-            time.sleep(0.1)
+        # schlafen — '-q' kehrt zurück, bevor der Prozess beendet ist. Hängt er,
+        # mit SIGTERM nachhelfen: Ein noch laufender Prozess würde die frischen
+        # Werte nachrastern und sich später unbemerkt verabschieden.
+        if not self._wait_nemo_desktop_gone(3):
+            subprocess.run(['pkill', '-TERM', '-x', 'nemo-desktop'],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if not self._wait_nemo_desktop_gone(3):
+                if log_callback:
+                    log_callback("  [Warnung] nemo-desktop lässt sich nicht beenden — "
+                                 "Nemo kann die Positionen nachrastern.")
+                return True
 
         if log_callback:
             log_callback("Nemo-Schreibtisch angehalten, schreibe Positionen...")
@@ -684,7 +716,9 @@ class IconManager:
 
     def _start_nemo_desktop(self, log_callback=None):
         """Startet den Nemo-Schreibtisch wieder (liest die Metadaten neu ein)."""
-        if self._nemo_desktop_running():
+        # Ein Prozess, der sich gerade noch beendet, darf den Neustart nicht
+        # verhindern — sonst bleibt der Schreibtisch leer, sobald er weg ist.
+        if not self._wait_nemo_desktop_gone(3):
             return
         if not self._which('nemo-desktop'):
             return
@@ -1000,8 +1034,9 @@ class DesktopIconManagerApp(QMainWindow):
         grid_layout.addLayout(spin_layout)
 
         if self.nemo_grid:
+            ox, oy = self.manager._grid_origin(self.nemo_grid)
             hint = (f"Nemos eigenes Zellraster: {default_x}x{default_y} px ab "
-                    f"({self.nemo_grid['origin_x']},{self.nemo_grid['origin_y']}).\n"
+                    f"({ox},{oy}).\n"
                     "Andere Werte zieht Nemo nach — die Abstände werden dann\n"
                     "ungleichmäßig.")
             self.spin_grid_x.setToolTip(hint)
@@ -1072,9 +1107,10 @@ class DesktopIconManagerApp(QMainWindow):
         else:
             self.log(f"System initialisiert. Desktop-Pfad: {self.manager.desktop_dir}")
             if self.nemo_grid:
+                ox, oy = self.manager._grid_origin(self.nemo_grid)
                 self.log(f"Nemo-Zellraster erkannt: "
                          f"{self.nemo_grid.get('cell_x') or '?'}x{self.nemo_grid.get('cell_y') or '?'} px "
-                         f"ab ({self.nemo_grid['origin_x']},{self.nemo_grid['origin_y']}) "
+                         f"ab ({ox},{oy}) "
                          f"– als Raster-Vorgabe übernommen.")
             else:
                 self.log("Hinweis: Nemos Zellraster nicht erkennbar, Vorgabe 100x100 ab (50,50).")
